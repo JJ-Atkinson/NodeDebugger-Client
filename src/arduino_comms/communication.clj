@@ -29,15 +29,12 @@
                 (assoc-in acc [:custom-values header] value))
               acc)) message-packet (:msgs message-packet)))
 
-(defn push-test-msg [msg]
-  (swap! current-accumulated-message #(let [[k v] (parse-var-set msg)]
-                                        (assoc-in % [:custom-values k] v))))
-
 (defn push-message [msg]
   (let [current @current-accumulated-message
         processed (pre-process-messages msg)
         log-view (concat @print-log (:msgs msg))
-        acc-msg (assoc processed :msgs log-view
+        acc-msg (assoc processed :time-posted (System/currentTimeMillis)
+                                 :msgs log-view
                                  :custom-values (merge
                                                   (:custom-values current)
                                                   (:custom-values processed)))]
@@ -46,6 +43,9 @@
     (reset! current-accumulated-message acc-msg)
     (swap! cached-messages #(conj % processed))
     (reset! print-log log-view)))
+
+(defn push-test-msg [msg]
+  (push-message {:msgs [msg]}))
 
 (defonce receive-loop
   (u/receive-loop

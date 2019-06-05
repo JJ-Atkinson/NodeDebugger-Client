@@ -2,21 +2,20 @@
   (:require [quil.core :as q]
             [quil.middleware :as m]
             [arduino-comms.communication :as c]
-            [clojure.string :as str])
-  (:import (processing.core PConstants PApplet)))
+            [clojure.string :as str]
+            [medley.core :as util]
+            [clojure.set :as set]))
 
-;; TODO: unify handling of errors in :custom-values. Should be easy.
 
 (defonce restart-sketch? true)
-
-(def sample-data (first @c/cached-messages))
 
 (def yellow -256)
 (def blue -7876885)
 (def red -65536)
 
 
-(defonce settings (atom {:filter-out-var-set? true}))
+(defonce settings (atom {:filter-out-var-set? true
+                         :use-auto-generated-ui? false}))
 
 
 (defn filter-visible-messages [msg-list]
@@ -25,64 +24,40 @@
     msg-list))
 
 
-(def visual-layout
-  {:left  [{:type       :toggle
-            :text       "P D7"
-            :value      [:digital 7]
-            :error-fn   [:eq false :value]
-            :warning-fn [:eq true :value]
-            :fallback   {:type  :text
-                         :value "Missing value PD7"}}
+(def visual-layout (read-string (slurp "layout.edn")))
 
-           {:type     :toggle
-            :text     "Toggle"
-            :value    [:custom-values :toggle]
-            :error-fn [:eq true :value]
-            :fallback {:type  :text
-                       :value "Missing :toggle"}}]
-   :right [{:type       :slider
-            :min        0
-            :max        100
-            :value      [:custom-values :dist-to-wall]
-            :warning-fn [:lt :value 8]
-            :fallback   {:type  :text
-                         :value "Missing :dist-to-wall"}}
-           
-           {:type     :slider
-            :min      0
-            :max      1000000
-            :value    [:custom-values :millis]
-            :error-fn [:gt :value 300000]}]})
+(def generated-layout (atom []))
 
+(def default-components
+  (->> [{:type  :toggle
+         :value false
+         :text  "DEFAULT TEXT"
+         :x     10
+         :y     10
+         :color blue}
+        {:type  :slider
+         :value 0
+         :text  "DEFAULT TEXT"
+         :min   0
+         :max   1024
+         :x     10
+         :y     10
+         :color blue}
+        {:type  :text
+         :text  "Default text"
+         :value "Default value"
+         :x     10
+         :y     10
+         :color blue}]
+       (group-by :type)
+       (util/map-vals first)))
 
-(defn switch-input [overrides]
-  (merge {:type  :toggle
-          :value false
-          :text  "DEFAULT TEXT"
-          :x     10
-          :y     10
-          :color blue}
-         overrides))
-
-(defn analog-input [overrides]
-  (merge {:type  :slider
-          :value -8
-          :text  "DEFAULT TEXT"
-          :min   0
-          :max   255
-          :x     10
-          :y     10
-          :color blue}
-         overrides))
-
-(defn text [overrides]
-  (merge {:type  :text
-          :x     10
-          :y     10
-          :color blue}
-         overrides))
+;;;;;;;;;;;;;;;
+;; ui rendering
+;;;;;;;;;;;;;;;
 
 (defmulti draw-ui-element :type)
+(defmulti valid-type-for-comp? (fn [c _] (:type c)))
 
 (defmethod draw-ui-element :toggle [{:keys [value text x y color]}]
   (q/stroke color)
@@ -91,6 +66,8 @@
   (q/rect x y 20 20)
   (q/fill color)
   (q/text (str text ": " value) (+ 30 x) y))
+
+(defmethod valid-type-for-comp? :toggle [_ value] (contains? #{1 0 true false} value))
 
 (defmethod draw-ui-element :slider [{:keys [value text x y color min max]}]
   (q/stroke color)
@@ -102,26 +79,141 @@
   (q/fill 255 255 255)
   (q/text (str text ": " value) (+ 170 x) y))
 
-(defmethod draw-ui-element :text [{:keys [value x y color]}]
+(defmethod valid-type-for-comp? :slider [_ value] (or (integer? value)
+                                                      (float? value)))
+
+(defmethod draw-ui-element :text [{:keys [text value x y color]}]
   (q/stroke color)
   (q/fill color)
   (when value (q/fill color))
-  (q/text value x y))
+  (q/text (str text value) x y))
+
+(defmethod valid-type-for-comp? :text [_ _] true)
+
+;;;;;;;;;;;;;;;;;;;;
+;; auto generated ui
+;;;;;;;;;;;;;;;;;;;;
+
+(defn unaccounted-custom-keys [ui-configuration]
+  (let [lst (reduce #(concat %1 (second %2)) [] ui-configuration)
+        accounted-values (mapcat (fn [{:keys [value]}]
+                                   (if (= :custom-values (first value))
+                                     [(second value)]
+                                     [])) lst)
+        leftover-vals (set/difference
+                        (set (keys (:custom-values @c/current-accumulated-message)))
+                        (set accounted-values))]
+    leftover-vals))
 
 
+(defn type-guess [value]
+  (cond (integer? value) :slider
+        (util/boolean? value) :toggle
+        :default :text))
+
+(defn generate-default-component [value-loc]
+  (let [v (get-in @c/current-accumulated-message value-loc)
+        type (type-guess v)]
+    (merge (type default-components)
+           {:text (str (second value-loc))
+            :value value-loc})))
+
+(defn handle-additional-custom-values []
+  (let [uack (unaccounted-custom-keys visual-layout)
+        comps (map #(generate-default-component [:custom-values %]) uack)]
+    (reset! generated-layout comps)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; convert ui configuration to renderable components
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+(defn render-edn-fn-to-fn [edn-fn]
+  (when edn-fn
+    (let [fns {:lt < :gt > :eq = :ne not= :lte <= :gte >=}
+          [f-kw & args] edn-fn
+          f (fns f-kw)
+          replace-with (fn [old new curr] (if (= curr old) new curr))]
+      (fn [value] (when value (apply f (map (partial replace-with :value value) args)))))))
+
+
+(defn render-edn-component-to-ui-config [edn-component]
+  ;; transforms: error-fn -> fn; warning-fn -> fn; fallback? -> component;
+  (when edn-component
+    (let [error-fn (render-edn-fn-to-fn (:error-fn edn-component))
+          warning-fn (render-edn-fn-to-fn (:warning-fn edn-component))
+          comp edn-component
+          comp (if error-fn (assoc comp :error-fn error-fn) comp)
+          comp (if warning-fn (assoc comp :warning-fn warning-fn) comp)]
+      comp)))
+
+
+(defn realize-ui-element
+  "Configure a ui element with the proper data for rendering"
+  [component-config data]
+  (let [{:keys [error-fn warning-fn value] :or {error-fn   (constantly false)
+                                                warning-fn (constantly false)}} component-config
+        fallback (merge (:text default-components)
+                        {:text  "Missing"
+                         :value value                       ; so we don't fallback on our fallback
+                         :color yellow})
+        v (get-in data value :ui/k-missing)
+        correct-type? (valid-type-for-comp? component-config v)
+        missing-value? (and (= :ui/k-missing v) (not (nil? value)))
+        use-fallback (or missing-value? (not correct-type?))
+        color (when (not use-fallback)
+                (cond (error-fn v) red
+                      (warning-fn v) yellow
+                      :default blue))]
+    (if use-fallback
+      fallback
+      (assoc component-config
+        :value v
+        :color color))))
+
+
+(defn render-edn-to-config [edn]
+  (let [upf #(map render-edn-component-to-ui-config %)
+        configured-layout (-> edn
+                              (update :left upf)
+                              (update :right upf))]
+    (if-not (:use-auto-generated-ui? @settings)
+      configured-layout
+      (let [additional-comps @generated-layout
+            num-for-l (- 5 (count (:left configured-layout)))
+            [r l] (split-at num-for-l additional-comps)]
+        (-> configured-layout
+            (update :left #(concat % l))
+            (update :right #(concat % r)))))))
+
+
+(defn ui-configuration [] (render-edn-to-config visual-layout))
 
 
 ;; LAYERS :: raw-data -> pretty-data -> ui-settings -> ui-layout -> render
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; interactive ui elements
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
 (def click-hotspots
   [{:x     45 :y 30
     :width 300 :height 50
-    :run   #(update % :filter-out-var-set? not)}])
+    :run   #(update % :filter-out-var-set? not)}
+   {:x     480 :y 30
+    :width 300 :height 50
+    :run   #(update % :use-auto-generated-ui? not)}])
 
 (defn additional-ui-elements []
-  [(switch-input {:text  "Filter out :var-set?"
-                  :value (:filter-out-var-set? @settings)
-                  :x     45 :y 50})])
+  [(merge (:toggle default-components)
+          {:text  "Filter out :var-set?"
+           :value (:filter-out-var-set? @settings)
+           :x     45 :y 50})
+   (merge (:toggle default-components)
+          {:text  "Use auto-generated ui?"
+           :value (:use-auto-generated-ui? @settings)
+           :x     480 :y 50})])
 
 (defn mouse-pressed [_ details]
   (let [mx (:x details) my (:y details)]
@@ -132,96 +224,51 @@
                        first)]
       (swap! settings (:run item)))))
 
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ui layout configuration 
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 (defn generate-spacing [start space]
   (iterate (partial + space) start))
 
 
 (defn data->ui-settings [data]
-  (let [aval #(get-in data [:analog %])
-        dval #(= 1 (get-in data [:digital %]))
+  (let [conf (ui-configuration)]
+    {:left   (map #(realize-ui-element % data) (:left conf))
 
-        ;sa (fn [label [min max]]
-        ;     (if-not value
-        ;       (text {:value (str label " - Missing")
-        ;              :color red})
-        ;       (merge-with #(if %2 %2 %1)
-        ;                   (analog-input {:text label :value value})
-        ;                   {:min   min
-        ;                    :max   max
-        ;                    :color (when (and error-fn (error-fn value)) red)})))
+     :right  (map #(realize-ui-element % data) (:right conf))
 
-        data-or-fallback (fn [data-path transform fails-fn works-fn]
-                           (let [v (get-in data data-path)
-                                 vt (try
-                                      (let [td (transform v)]
-                                        (if (not= nil td)
-                                          td
-                                          :ac/failure))
-                                      (catch Exception e
-                                        :ac/failure))]
-                             (if (not= vt :ac/failure)
-                               (works-fn vt)
-                               (fails-fn v))))
-
-        attach-error (fn [error-fn component]
-                       (if (try (error-fn (:value component))
-                                (catch Exception e false))
-                         (assoc component :color red)
-                         component))
-
-        default-error-handler (fn [data-path transform component]
-                                (data-or-fallback data-path transform
-                                                  #(text {:value (str "Error: " (:text component)
-                                                                      " = " %)
-                                                          :color yellow})
-                                                  #(assoc component
-                                                     :value %)))
-
-        ]
-    {:top-left  [(text {:value (str "Curr Mode " (get-in data [:custom-values :curr-mode]))})
-                 (->> (switch-input {:text "P D7"})
-                      (default-error-handler [:digital 12] #(if (integer? %) % nil))
-                      (attach-error (partial = 0)))
-
-                 (->> (switch-input {:text "Toggle"})
-                      (default-error-handler [:custom-values :toggle] identity)
-                      (attach-error (partial = true)))
-                 ]
-
-     :top-right [(->> (analog-input {:text "Dist to wall"})
-                      (default-error-handler [:custom-values :dist-to-wall] #(if (integer? %) % nil))
-                      (attach-error (partial < 500)))
-                 (->> (analog-input {:text "Time (s)" :min 0 :max 1000})
-                      (default-error-handler [:custom-values :millis] #(float (/ % 1000)))
-                      (attach-error (partial < 50)))
-                 ]
-
-     :bottom    (map (fn [value]
-                       (let [ret (text {:value value})
-                             classification (c/classify value)]
-                         (->> classification
-                              (get {:error   red
-                                    :var-set yellow
-                                    :default blue})
-                              (assoc ret :color))))
-                     (->> (:msgs data) reverse filter-visible-messages (take 21)))}))
+     :bottom (map (fn [value]
+                    (let [ret (merge (:text default-components) {:value value :text ""})
+                          classification (c/classify value)]
+                      (->> classification
+                           (get {:error   red
+                                 :var-set yellow
+                                 :default blue})
+                           (assoc ret :color))))
+                  (->> (:msgs data) reverse filter-visible-messages (take 21)))}))
 
 
 
 (defn ui-settings->ui-layout [settings]
-  (let [{:keys [top-left top-right bottom]} settings]
+  (let [{:keys [left right bottom]} settings]
     (concat (map (fn [elem y]
                    (assoc elem :x 45
                                :y y))
-                 top-left (generate-spacing 130 35))
+                 left (generate-spacing 130 35))
             (map (fn [elem y]
                    (assoc elem :x 480
                                :y y))
-                 top-right (generate-spacing 130 35))
+                 right (generate-spacing 130 35))
             (map (fn [elem y]
                    (assoc elem :x 40
                                :y (+ 840 y)))
                  bottom (generate-spacing 20 -26)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; (mostly) static ui elements
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
 (defn draw-boxes []
@@ -231,8 +278,19 @@
   (q/rect 25 25 850 70)
   (q/rect 450 110 425 200)
   (q/rect 25 110 400 200)
+
+  (q/no-stroke)
+
+  (let [c (- (System/currentTimeMillis)
+             (:time-posted @c/current-accumulated-message)
+             300)]
+    (q/fill (q/lerp-color blue red (q/map-range c 0 1000 -0.5 1)))
+    (q/rect 0 0 (q/map-range c 0 1000 0 900) 5))
   )
 
+;;;;;;;;;;;;;;
+;; quill stuff
+;;;;;;;;;;;;;;
 
 (defn setup []
 
@@ -253,7 +311,7 @@
   ; Clear the sketch by filling it with light-grey color.
   (q/background 0)
   ; Set circle color.
-
+  (handle-additional-custom-values)
   (q/text-align :left :top)
   (q/text-size 20)
   (if-let [data @c/current-accumulated-message]
@@ -271,7 +329,7 @@
 
 (when restart-sketch?
   (q/defsketch arduino-comms
-               :title "You spin my circle right round"
+               :title "Debugger - Arduino"
                :size [900 900]
                ; setup function called only once, during sketch initialization.
                :setup setup
