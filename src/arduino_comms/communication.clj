@@ -47,11 +47,12 @@
 (defn push-test-msg [msg]
   (push-message {:msgs [msg]}))
 
-(defonce receive-loop
-  (u/receive-loop
-    socket
-    (u/empty-packet 30000)
-    (fn [pkt] (push-message (j/parse-string pkt keyword)))))
+(defn start []
+      (defonce receive-loop
+               (u/receive-loop
+                 socket
+                 (u/empty-packet 30000)
+                 (fn [pkt] (push-message (j/parse-string pkt keyword))))))
 
 
 
